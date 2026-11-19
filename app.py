@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+import os
 
 import torch
 
@@ -20,7 +20,7 @@ from transformers import (
     AutoModelForSequenceClassification
 )
 
-from values import Token
+Token = os.environ.get("Token", "")
 
 
 # ==========================================
