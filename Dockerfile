@@ -1,3 +1,4 @@
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -11,18 +12,17 @@ ENV MKL_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
 ENV MALLOC_ARENA_MAX=2
 
+# Установка CPU-версии PyTorch
 RUN pip install --no-cache-dir \
     torch==2.5.1 torchvision==0.20.1 \
     --index-url https://download.pytorch.org/whl/cpu
 
+# Установка остальных зависимостей
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir timm==1.0.30 safetensors python-multipart
+RUN pip install --no-cache-dir -r requirements.txt
 
+# Копирование приложения
 COPY app.py .
-
-# RuToxic downloads on startup; the image classifier downloads lazily on its first request.
-# No local model/ directory is required in the Docker build.
 
 EXPOSE 10000
 
