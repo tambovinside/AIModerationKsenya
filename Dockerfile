@@ -12,15 +12,16 @@ ENV OPENBLAS_NUM_THREADS=1
 ENV MALLOC_ARENA_MAX=2
 
 RUN pip install --no-cache-dir \
-    torch==2.5.1 \
+    torch==2.5.1 torchvision==0.20.1 \
     --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir timm==1.0.30 safetensors python-multipart
 
 COPY app.py .
 
-# The model is downloaded by app.py from Hugging Face on first startup.
+# RuToxic downloads on startup; the image classifier downloads lazily on its first request.
 # No local model/ directory is required in the Docker build.
 
 EXPOSE 10000
