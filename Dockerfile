@@ -1,13 +1,9 @@
-
 FROM python:3.11-slim
 
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-
-ENV HF_HUB_OFFLINE=1
-ENV TRANSFORMERS_OFFLINE=1
 ENV TOKENIZERS_PARALLELISM=false
 
 ENV OMP_NUM_THREADS=1
@@ -20,12 +16,12 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-COPY model ./model
+# The model is downloaded by app.py from Hugging Face on first startup.
+# No local model/ directory is required in the Docker build.
 
 EXPOSE 10000
 
