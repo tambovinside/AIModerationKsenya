@@ -35,8 +35,8 @@ MODEL_NAME = "Aveniats/Tocxic-moderation"
 MODEL_VERSION = "RuToxic multi-label"
 
 IMAGE_MODEL_PATH = MODEL_PATH / "image_model"
-IMAGE_MODEL_CONFIG_URL = "https://huggingface.co/Aveniats/image-toxic-ksenya/resolve/main/config.json?download=true"
-IMAGE_MODEL_WEIGHTS_URL = "https://huggingface.co/Aveniats/image-toxic-ksenya/resolve/main/model.safetensors?download=true"
+IMAGE_MODEL_CONFIG_URL = "https://huggingface.co/OwenElliott/image-safety-classifier-xs/resolve/main/config.json?download=true"
+IMAGE_MODEL_WEIGHTS_URL = "https://huggingface.co/OwenElliott/image-safety-classifier-xs/resolve/main/model.safetensors?download=true"
 IMAGE_LABELS = ["NSFL", "NSFW", "SFW"]
 
 # Thresholds are configurable in Render Environment.
@@ -303,8 +303,13 @@ def _image_tensor(raw: bytes) -> torch.Tensor:
     return (tensor - mean) / std
 
 
-def classify_images_and_unload(raw_images: list[bytes]) -> dict:
-    """Модель картинок существует в памяти только во время этого вызова."""
+def classify_images_cached(raw_images: list[bytes]) -> dict:
+    """Загружает SwiftFormer XS один раз и держит его в памяти между запросами.
+
+    Это убирает повторное создание модели и чтение весов для каждого фото.
+    Inference выполняется в общем однопоточном executor, поэтому одновременной
+    загрузки второй копии модели не возникает.
+    """
     global image_model, image_model_loaded, image_requests, image_failures
     import timm
     from timm.models.swiftformer import checkpoint_filter_fn
@@ -312,41 +317,47 @@ def classify_images_and_unload(raw_images: list[bytes]) -> dict:
 
     started = time.perf_counter()
     try:
-        ensure_image_model_files()
-        # SwiftFormer XS в timm содержит обе головы классификатора: head и head_dist.
-        image_model = timm.create_model("swiftformer_xs", pretrained=False, num_classes=3)
-        state = load_file(str(IMAGE_MODEL_PATH / "model.safetensors"), device="cpu")
-        if state and all(key.startswith("module.") for key in state):
-            state = {key[7:]: value for key, value in state.items()}
-        if state and all(key.startswith("model.") for key in state):
-            state = {key[6:]: value for key, value in state.items()}
-        # Конвертирует ключи исходной реализации SwiftFormer в формат timm.
-        state = checkpoint_filter_fn(state, image_model)
-        missing, unexpected = image_model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            raise RuntimeError(f"Image model weights mismatch; missing={missing[:8]}, unexpected={unexpected[:8]}")
-        image_model.eval()
-        image_model_loaded = True
+        if image_model is None or not image_model_loaded:
+            ensure_image_model_files()
+            loaded_model = timm.create_model("swiftformer_xs", pretrained=False, num_classes=3)
+            state = load_file(str(IMAGE_MODEL_PATH / "model.safetensors"), device="cpu")
+            if state and all(key.startswith("module.") for key in state):
+                state = {key[7:]: value for key, value in state.items()}
+            if state and all(key.startswith("model.") for key in state):
+                state = {key[6:]: value for key, value in state.items()}
+            state = checkpoint_filter_fn(state, loaded_model)
+            missing, unexpected = loaded_model.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"Image model weights mismatch; missing={missing[:8]}, unexpected={unexpected[:8]}"
+                )
+            loaded_model.eval()
+            image_model = loaded_model
+            image_model_loaded = True
+            logger.info("Image safety classifier loaded and cached in memory")
+
         batch = torch.stack([_image_tensor(raw) for raw in raw_images])
         with torch.inference_mode():
             logits = image_model(batch)
             if isinstance(logits, (tuple, list)):
                 logits = sum(logits) / len(logits)
             probabilities = torch.softmax(logits, dim=1).cpu().tolist()
+
         results = []
         violation = False
         for scores in probabilities:
             top_index = max(range(len(scores)), key=lambda index: scores[index])
             label = IMAGE_LABELS[top_index]
-            violation = violation or label == "NSFW"
+            is_unsafe = label in ("NSFL", "NSFW")
+            violation = violation or is_unsafe
             results.append({
                 "label": label,
                 "scores": {name: round(float(scores[index]), 6) for index, name in enumerate(IMAGE_LABELS)},
-                "violation": label == "NSFW",
+                "violation": is_unsafe,
             })
         image_requests += 1
         return {
-            "model": "Aveniats/image-toxic-ksenya",
+            "model": "OwenElliott/image-safety-classifier-xs",
             "label_names": IMAGE_LABELS,
             "violation": violation,
             "results": results,
@@ -355,11 +366,6 @@ def classify_images_and_unload(raw_images: list[bytes]) -> dict:
     except Exception:
         image_failures += 1
         raise
-    finally:
-        image_model = None
-        image_model_loaded = False
-        gc.collect()
-
 
 # ============================================================
 # CLASSIFICATION
@@ -524,6 +530,8 @@ async def lifespan(app: FastAPI):
         inference_executor.shutdown(wait=True, cancel_futures=True)
         model = None
         tokenizer = None
+        image_model = None
+        image_model_loaded = False
         logger.info("RuToxic API stopped")
 
 
@@ -627,7 +635,7 @@ async def check_images(files: list[UploadFile] = File(...), x_api_token: str = H
     loop = asyncio.get_running_loop()
     try:
         # Один общий executor (max_workers=1) сериализует текстовые и визуальные inference.
-        result = await loop.run_in_executor(inference_executor, classify_images_and_unload, raw_images)
+        result = await loop.run_in_executor(inference_executor, classify_images_cached, raw_images)
         return result
     except Exception as error:
         logger.exception("Image classification failed: %s", error)
