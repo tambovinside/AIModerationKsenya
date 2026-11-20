@@ -6,6 +6,11 @@ import os
 import time
 import urllib.error
 import urllib.request
+import gc
+import io
+
+from PIL import Image
+from fastapi import UploadFile, File
 
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -28,6 +33,11 @@ API_TOKEN = os.environ.get("Token", "").strip()
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "/app/model"))
 MODEL_NAME = "Aveniats/Tocxic-moderation"
 MODEL_VERSION = "RuToxic multi-label"
+
+IMAGE_MODEL_PATH = MODEL_PATH / "image_model"
+IMAGE_MODEL_CONFIG_URL = "https://huggingface.co/Aveniats/image-toxic-ksenya/resolve/main/config.json?download=true"
+IMAGE_MODEL_WEIGHTS_URL = "https://huggingface.co/Aveniats/image-toxic-ksenya/resolve/main/model.safetensors?download=true"
+IMAGE_LABELS = ["NSFL", "NSFW", "SFW"]
 
 # Thresholds are configurable in Render Environment.
 # Profanity/obscenity is deliberately NOT included in toxic class.
@@ -87,6 +97,10 @@ model = None
 request_queue = None
 inference_executor = None
 worker_task = None
+image_model = None
+image_model_loaded = False
+image_requests = 0
+image_failures = 0
 
 ready = False
 accepting_requests = False
@@ -222,6 +236,129 @@ def load_model() -> None:
     logger.info("RuToxic model loaded successfully")
     logger.info("Labels: %s", model.config.id2label)
     logger.info("Parameters: %s", sum(parameter.numel() for parameter in model.parameters()))
+
+
+# ============================================================
+# LAZY IMAGE CLASSIFIER
+# ============================================================
+
+def ensure_image_model_files() -> None:
+    IMAGE_MODEL_PATH.mkdir(parents=True, exist_ok=True)
+    download_file_to(IMAGE_MODEL_PATH / "config.json", IMAGE_MODEL_CONFIG_URL)
+    download_file_to(IMAGE_MODEL_PATH / "model.safetensors", IMAGE_MODEL_WEIGHTS_URL)
+    with open(IMAGE_MODEL_PATH / "config.json", "r", encoding="utf-8") as file:
+        config = json.load(file)
+    if config.get("architecture") != "swiftformer_xs" or config.get("num_classes") != 3:
+        raise RuntimeError(f"Unexpected image model config: {config}")
+    names = config.get("pretrained_cfg", {}).get("label_names")
+    if names and names != IMAGE_LABELS:
+        raise RuntimeError(f"Unexpected image labels: {names}")
+
+
+def download_file_to(target: Path, url: str) -> None:
+    if target.is_file() and target.stat().st_size > 0:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".part")
+    last_error = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            logger.info("Downloading image model file %s (attempt %s/%s)", target.name, attempt, DOWNLOAD_RETRIES)
+            request = urllib.request.Request(url, headers={"User-Agent": "Ksenya-Image-Moderation/1.0"})
+            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response, open(temporary, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+            if not temporary.exists() or temporary.stat().st_size == 0:
+                raise RuntimeError(f"Image model file is empty: {target.name}")
+            temporary.replace(target)
+            logger.info("Downloaded image model file %s (%s bytes)", target.name, target.stat().st_size)
+            return
+        except Exception as error:
+            last_error = error
+            temporary.unlink(missing_ok=True)
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(min(attempt * 2, 5))
+    raise RuntimeError(f"Could not download image model file {target.name}: {last_error}")
+
+
+def _image_tensor(raw: bytes) -> torch.Tensor:
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    # config.json: 224x224, bicubic, crop_pct=0.95, center crop, ImageNet stats.
+    resize_size = int(round(224 / 0.95))
+    width, height = image.size
+    scale = resize_size / min(width, height)
+    resized = (max(resize_size, int(round(width * scale))), max(resize_size, int(round(height * scale))))
+    image = image.resize(resized, resample=Image.Resampling.BICUBIC)
+    left = (image.width - 224) // 2
+    top = (image.height - 224) // 2
+    image = image.crop((left, top, left + 224, top + 224))
+    import numpy as np
+    array = np.asarray(image, dtype="float32") / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1)
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+    return (tensor - mean) / std
+
+
+def classify_images_and_unload(raw_images: list[bytes]) -> dict:
+    """Модель картинок существует в памяти только во время этого вызова."""
+    global image_model, image_model_loaded, image_requests, image_failures
+    import timm
+    from timm.models.swiftformer import checkpoint_filter_fn
+    from safetensors.torch import load_file
+
+    started = time.perf_counter()
+    try:
+        ensure_image_model_files()
+        # SwiftFormer XS в timm содержит обе головы классификатора: head и head_dist.
+        image_model = timm.create_model("swiftformer_xs", pretrained=False, num_classes=3)
+        state = load_file(str(IMAGE_MODEL_PATH / "model.safetensors"), device="cpu")
+        if state and all(key.startswith("module.") for key in state):
+            state = {key[7:]: value for key, value in state.items()}
+        if state and all(key.startswith("model.") for key in state):
+            state = {key[6:]: value for key, value in state.items()}
+        # Конвертирует ключи исходной реализации SwiftFormer в формат timm.
+        state = checkpoint_filter_fn(state, image_model)
+        missing, unexpected = image_model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(f"Image model weights mismatch; missing={missing[:8]}, unexpected={unexpected[:8]}")
+        image_model.eval()
+        image_model_loaded = True
+        batch = torch.stack([_image_tensor(raw) for raw in raw_images])
+        with torch.inference_mode():
+            logits = image_model(batch)
+            if isinstance(logits, (tuple, list)):
+                logits = sum(logits) / len(logits)
+            probabilities = torch.softmax(logits, dim=1).cpu().tolist()
+        results = []
+        violation = False
+        for scores in probabilities:
+            top_index = max(range(len(scores)), key=lambda index: scores[index])
+            label = IMAGE_LABELS[top_index]
+            violation = violation or label == "NSFW"
+            results.append({
+                "label": label,
+                "scores": {name: round(float(scores[index]), 6) for index, name in enumerate(IMAGE_LABELS)},
+                "violation": label == "NSFW",
+            })
+        image_requests += 1
+        return {
+            "model": "Aveniats/image-toxic-ksenya",
+            "label_names": IMAGE_LABELS,
+            "violation": violation,
+            "results": results,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+    except Exception:
+        image_failures += 1
+        raise
+    finally:
+        image_model = None
+        image_model_loaded = False
+        gc.collect()
 
 
 # ============================================================
@@ -426,6 +563,9 @@ async def health():
             "queue_limit": MAX_QUEUE_SIZE,
             "processed": processed_requests,
             "failed": failed_requests,
+            "image_model_loaded": image_model_loaded,
+            "image_processed": image_requests,
+            "image_failed": image_failures,
         },
     )
 
@@ -468,3 +608,27 @@ async def check_text(data: CheckRequest, x_api_token: str = Header(default="")):
         raise HTTPException(status_code=504, detail="Processing timeout")
     except Exception:
         raise HTTPException(status_code=500, detail="Classification failed")
+
+
+@app.post("/check-image")
+async def check_images(files: list[UploadFile] = File(...), x_api_token: str = Header(default="")):
+    if not hmac.compare_digest(x_api_token, API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid API token")
+    if not ready or not accepting_requests:
+        raise HTTPException(status_code=503, detail="Server unavailable")
+    if not files or len(files) > 5:
+        raise HTTPException(status_code=400, detail="Send between 1 and 5 image frames")
+    raw_images = []
+    for upload in files:
+        content = await upload.read()
+        if not content or len(content) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Image is empty or too large")
+        raw_images.append(content)
+    loop = asyncio.get_running_loop()
+    try:
+        # Один общий executor (max_workers=1) сериализует текстовые и визуальные inference.
+        result = await loop.run_in_executor(inference_executor, classify_images_and_unload, raw_images)
+        return result
+    except Exception as error:
+        logger.exception("Image classification failed: %s", error)
+        raise HTTPException(status_code=500, detail="Image classification failed")
