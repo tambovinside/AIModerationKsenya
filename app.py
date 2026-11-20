@@ -39,6 +39,16 @@ IMAGE_MODEL_CONFIG_URL = "https://huggingface.co/OwenElliott/image-safety-classi
 IMAGE_MODEL_WEIGHTS_URL = "https://huggingface.co/OwenElliott/image-safety-classifier-xs/resolve/main/model.safetensors?download=true"
 IMAGE_LABELS = ["NSFL", "NSFW", "SFW"]
 
+# Russian FastText spam classifier (single-file supervised model).
+SPAM_MODEL_REPO = os.environ.get("SPAM_MODEL_REPO", "Aveniats/reklama-ksenya").strip()
+SPAM_MODEL_FILENAME = os.environ.get("SPAM_MODEL_FILENAME", "model.bin").strip()
+SPAM_MODEL_PATH = MODEL_PATH / "spam" / SPAM_MODEL_FILENAME
+SPAM_MODEL_URL = (
+    f"https://huggingface.co/{SPAM_MODEL_REPO}/resolve/main/"
+    f"{SPAM_MODEL_FILENAME}?download=true"
+)
+SPAM_THRESHOLD = float(os.environ.get("SPAM_THRESHOLD", "0.90"))
+
 # Thresholds are configurable in Render Environment.
 # Profanity/obscenity is deliberately NOT included in toxic class.
 INSULT_THRESHOLD = float(os.environ.get("INSULT_THRESHOLD", "0.70"))
@@ -101,6 +111,9 @@ image_model = None
 image_model_loaded = False
 image_requests = 0
 image_failures = 0
+spam_model = None
+spam_requests = 0
+spam_failures = 0
 
 ready = False
 accepting_requests = False
@@ -236,6 +249,61 @@ def load_model() -> None:
     logger.info("RuToxic model loaded successfully")
     logger.info("Labels: %s", model.config.id2label)
     logger.info("Parameters: %s", sum(parameter.numel() for parameter in model.parameters()))
+
+
+# ============================================================
+# FASTTEXT SPAM CLASSIFIER
+# ============================================================
+
+def load_spam_model() -> None:
+    """Downloads and caches the FastText spam model once at startup."""
+    global spam_model
+    import fasttext  # provided by fasttext-wheel; imported lazily
+
+    download_file_to(SPAM_MODEL_PATH, SPAM_MODEL_URL)
+    loaded = fasttext.load_model(str(SPAM_MODEL_PATH))
+    labels = set(loaded.get_labels())
+    if "__label__spam" not in labels:
+        raise RuntimeError(
+            f"FastText model has no __label__spam class; labels={sorted(labels)}"
+        )
+    spam_model = loaded
+    logger.info(
+        "FastText spam model loaded: repo=%s file=%s labels=%s",
+        SPAM_MODEL_REPO,
+        SPAM_MODEL_FILENAME,
+        sorted(labels),
+    )
+
+
+def classify_spam(text: str) -> dict:
+    """Returns the probability of the __label__spam class."""
+    global spam_requests, spam_failures
+    started = time.perf_counter()
+    try:
+        if spam_model is None:
+            raise RuntimeError("FastText spam model is not loaded")
+        processed = str(text or "").lower().replace("\n", "\t").strip()
+        if not processed:
+            raise ValueError("Text cannot be empty")
+        labels, probabilities = spam_model.predict(processed[:MAX_TEXT_LENGTH], k=2)
+        spam_score = max(
+            (float(probability) for label, probability in zip(labels, probabilities)
+             if label == "__label__spam"),
+            default=0.0,
+        )
+        spam_requests += 1
+        return {
+            "model": f"{SPAM_MODEL_REPO}/{SPAM_MODEL_FILENAME}",
+            "label": "spam" if spam_score >= SPAM_THRESHOLD else "ham",
+            "is_spam": bool(spam_score >= SPAM_THRESHOLD),
+            "spam_score": round(spam_score, 6),
+            "threshold": SPAM_THRESHOLD,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+    except Exception:
+        spam_failures += 1
+        raise
 
 
 # ============================================================
@@ -487,7 +555,7 @@ async def queue_worker() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global request_queue, inference_executor, worker_task
-    global ready, accepting_requests, model, tokenizer
+    global ready, accepting_requests, model, tokenizer, spam_model
 
     if len(API_TOKEN) < 32:
         raise RuntimeError("Environment variable Token must contain at least 32 characters")
@@ -496,6 +564,7 @@ async def lifespan(app: FastAPI):
 
     # Download missing model files, then load model once.
     await asyncio.to_thread(load_model)
+    await asyncio.to_thread(load_spam_model)
 
     request_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     inference_executor = ThreadPoolExecutor(
@@ -532,6 +601,7 @@ async def lifespan(app: FastAPI):
         tokenizer = None
         image_model = None
         image_model_loaded = False
+        spam_model = None
         logger.info("RuToxic API stopped")
 
 
@@ -574,6 +644,9 @@ async def health():
             "image_model_loaded": image_model_loaded,
             "image_processed": image_requests,
             "image_failed": image_failures,
+            "spam_model_loaded": spam_model is not None,
+            "spam_processed": spam_requests,
+            "spam_failed": spam_failures,
         },
     )
 
@@ -616,6 +689,27 @@ async def check_text(data: CheckRequest, x_api_token: str = Header(default="")):
         raise HTTPException(status_code=504, detail="Processing timeout")
     except Exception:
         raise HTTPException(status_code=500, detail="Classification failed")
+
+
+@app.post("/check-spam")
+async def check_spam(data: CheckRequest, x_api_token: str = Header(default="")):
+    if not hmac.compare_digest(x_api_token, API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid API token")
+    if not ready or not accepting_requests:
+        raise HTTPException(status_code=503, detail="Server unavailable")
+    if not data.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+    if spam_model is None:
+        raise HTTPException(status_code=503, detail="Spam model unavailable")
+
+    loop = asyncio.get_running_loop()
+    try:
+        # Shared single-worker executor prevents model inference from competing
+        # with the existing toxicity and image classifiers.
+        return await loop.run_in_executor(inference_executor, classify_spam, data.text)
+    except Exception as error:
+        logger.exception("Spam classification failed: %s", error)
+        raise HTTPException(status_code=500, detail="Spam classification failed")
 
 
 @app.post("/check-image")
