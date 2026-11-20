@@ -2,3 +2,11 @@ fastapi==0.115.6
 uvicorn==0.34.0
 transformers==4.48.3
 safetensors==0.5.2
+
+# FastText для проверки спама
+fasttext-wheel
+numpy<2.0
+
+# Дополнительные зависимости приложения
+timm==1.0.30
+python-multipart
